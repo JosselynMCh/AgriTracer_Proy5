@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { apiFetch } from '../../services/apiClient'
+import { exportReportesToPdf } from '../../utils/exportReportesPdf'
 import LoadingOverlay from '../common/LoadingOverlay'
 
 const PERIOD_OPTIONS = [
@@ -9,6 +10,12 @@ const PERIOD_OPTIONS = [
 ]
 
 const PIE_COLORS = ['#2563eb', '#f59e0b', '#ef4444', '#16a34a', '#8b5cf6']
+const COST_BAR_COLORS = {
+  FLETE: 'bg-[#147a3f]',
+  COMBUSTIBLE: 'bg-amber-500',
+  PEAJE: 'bg-sky-500',
+  OTRO: 'bg-violet-500',
+}
 
 function polarToCartesian(cx, cy, r, angleDeg) {
   const rad = ((angleDeg - 90) * Math.PI) / 180
@@ -43,33 +50,45 @@ function createPieSlices(items, cx, cy, r) {
 
 export default function ReportesAnaliticaSection() {
   const [period, setPeriod] = useState('30d')
-  const [loadedPeriod, setLoadedPeriod] = useState(null)
+  const [fromDate, setFromDate] = useState('')
+  const [toDate, setToDate] = useState('')
+  const [zoneId, setZoneId] = useState('')
+  const [loadedKey, setLoadedKey] = useState(null)
   const [data, setData] = useState(null)
   const [error, setError] = useState('')
   const [exportOpen, setExportOpen] = useState(false)
 
+  const queryKey = `${period}|${fromDate}|${toDate}|${zoneId}`
+
   useEffect(() => {
     let cancelled = false
-    apiFetch(`/api/reportes?period=${period}`)
+    const params = new URLSearchParams({ period })
+    if (fromDate && toDate) {
+      params.set('from', fromDate)
+      params.set('to', toDate)
+    }
+    if (zoneId) params.set('id_zona', zoneId)
+
+    apiFetch(`/api/reportes?${params.toString()}`)
       .then((res) => {
         if (!cancelled) {
           setData(res)
-          setLoadedPeriod(period)
+          setLoadedKey(queryKey)
           setError('')
         }
       })
       .catch((err) => {
         if (!cancelled) {
-          setLoadedPeriod(period)
+          setLoadedKey(queryKey)
           setError(err.message)
         }
       })
     return () => {
       cancelled = true
     }
-  }, [period])
+  }, [period, fromDate, toDate, zoneId, queryKey])
 
-  const loading = loadedPeriod !== period && !error
+  const loading = loadedKey !== queryKey && !error
 
   const kpis = data?.kpis || {}
   const series =
@@ -77,6 +96,10 @@ export default function ReportesAnaliticaSection() {
       ? data.reingresoSerie
       : [{ label: 'Sin datos', value: 0 }]
   const pieSlices = createPieSlices(data?.distribucionZonas || [], 80, 80, 70)
+  const costosPorTipo = data?.costosPorTipo || []
+  const resumenPorZona = data?.resumenPorZona || []
+  const topTrabajadores = data?.topTrabajadores || []
+  const zonas = data?.zonas || []
 
   const width = 460
   const height = 165
@@ -111,20 +134,38 @@ export default function ReportesAnaliticaSection() {
 
   const lastPoint = points[points.length - 1]
 
+  const periodLabel =
+    fromDate && toDate
+      ? `${fromDate} a ${toDate}`
+      : PERIOD_OPTIONS.find((p) => p.key === period)?.label || period
+  const zonaLabel =
+    zonas.find((z) => String(z.id_zona) === zoneId)?.nombre || 'Todas las zonas'
+
   const handleExportCsv = () => {
     const rows = [
+      ['REPORTE ANALITICO AGRI-TRACER', periodLabel, zonaLabel],
+      [],
       ['Indicador', 'Valor'],
       ['Costo Promedio por Persona', `S/. ${Number(kpis.costoPromedio || 0).toFixed(2)}`],
       ['Reingreso HPW', `${Number(kpis.reingresoHpw || 0).toFixed(1)}%`],
       ['Puntualidad de Buses', `${Number(kpis.puntualidadBuses || 0).toFixed(1)}%`],
       ['Trabajadores Activos', kpis.trabajadoresActivos ?? 0],
+      [],
+      ['RESUMEN POR ZONA', 'Convocatorias', 'Requeridos', 'Viajes', 'Costo Total'],
+      ...resumenPorZona.map((z) => [
+        z.zona,
+        z.convocatorias,
+        z.requeridos,
+        z.viajes,
+        `S/. ${Number(z.costo_total || 0).toFixed(2)}`,
+      ]),
     ]
     const csvContent = rows.map((r) => r.join(',')).join('\n')
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })
     const url = URL.createObjectURL(blob)
     const link = document.createElement('a')
     link.href = url
-    link.setAttribute('download', 'reporte_agri_tracer.csv')
+    link.setAttribute('download', 'reporte_analitica_agri_tracer.csv')
     document.body.appendChild(link)
     link.click()
     document.body.removeChild(link)
@@ -132,18 +173,36 @@ export default function ReportesAnaliticaSection() {
     setExportOpen(false)
   }
 
+  const handleExportPdf = () => {
+    setExportOpen(false)
+    exportReportesToPdf({
+      periodLabel,
+      zonaLabel,
+      kpis,
+      costosPorTipo,
+      resumenPorZona,
+      topTrabajadores,
+    })
+  }
+
   return (
     <div className="space-y-4">
       <LoadingOverlay show={loading} />
+
+      {/* Barra de filtros y exportación */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-2">
           {PERIOD_OPTIONS.map((option) => {
-            const active = period === option.key
+            const active = period === option.key && !(fromDate && toDate)
             return (
               <button
                 key={option.key}
                 type="button"
-                onClick={() => setPeriod(option.key)}
+                onClick={() => {
+                  setFromDate('')
+                  setToDate('')
+                  setPeriod(option.key)
+                }}
                 className={`rounded-lg px-3.5 py-2 text-xs sm:text-sm font-semibold transition cursor-pointer ${
                   active
                     ? 'bg-[#147a3f] text-white shadow-xs'
@@ -154,6 +213,38 @@ export default function ReportesAnaliticaSection() {
               </button>
             )
           })}
+
+          <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 text-xs">
+            <input
+              type="date"
+              value={fromDate}
+              onChange={(e) => setFromDate(e.target.value)}
+              aria-label="Fecha desde"
+              className="outline-none text-gray-700"
+            />
+            <span className="text-gray-400">–</span>
+            <input
+              type="date"
+              value={toDate}
+              onChange={(e) => setToDate(e.target.value)}
+              aria-label="Fecha hasta"
+              className="outline-none text-gray-700"
+            />
+          </div>
+
+          <select
+            value={zoneId}
+            onChange={(e) => setZoneId(e.target.value)}
+            aria-label="Filtrar por zona"
+            className="rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs sm:text-sm font-medium text-gray-700 outline-none focus:border-[#147a3f]"
+          >
+            <option value="">Todas las zonas</option>
+            {zonas.map((z) => (
+              <option key={z.id_zona} value={z.id_zona}>
+                {z.nombre}
+              </option>
+            ))}
+          </select>
         </div>
 
         <div className="relative">
@@ -169,23 +260,20 @@ export default function ReportesAnaliticaSection() {
           </button>
 
           {exportOpen && (
-            <div className="absolute right-0 mt-1.5 w-44 rounded-xl border border-gray-200 bg-white py-1.5 shadow-lg z-20 text-xs">
+            <div className="absolute right-0 mt-1.5 w-48 rounded-xl border border-gray-200 bg-white py-1.5 shadow-lg z-20 text-xs">
+              <button
+                type="button"
+                onClick={handleExportPdf}
+                className="block w-full px-4 py-2 text-left font-medium text-gray-700 hover:bg-emerald-50 hover:text-[#147a3f] cursor-pointer"
+              >
+                Descargar Reporte (.pdf)
+              </button>
               <button
                 type="button"
                 onClick={handleExportCsv}
                 className="block w-full px-4 py-2 text-left font-medium text-gray-700 hover:bg-emerald-50 hover:text-[#147a3f] cursor-pointer"
               >
                 Exportar Excel (.csv)
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setExportOpen(false)
-                  window.print()
-                }}
-                className="block w-full px-4 py-2 text-left font-medium text-gray-700 hover:bg-emerald-50 hover:text-[#147a3f] cursor-pointer"
-              >
-                Imprimir / PDF
               </button>
             </div>
           )}
@@ -198,6 +286,7 @@ export default function ReportesAnaliticaSection() {
         </div>
       )}
 
+      {/* 4 Tarjetas KPI */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <div className="flex items-center gap-3.5 rounded-xl border border-gray-200/80 bg-white p-4 shadow-xs">
           <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-600">
@@ -256,6 +345,7 @@ export default function ReportesAnaliticaSection() {
         </div>
       </div>
 
+      {/* Gráficos principales */}
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
         <div className="xl:col-span-7 rounded-xl border border-gray-200/80 bg-white p-5 shadow-xs">
           <h2 className="mb-4 text-[15px] font-bold text-gray-900">
@@ -350,6 +440,123 @@ export default function ReportesAnaliticaSection() {
               ))}
             </ul>
           </div>
+        </div>
+      </div>
+
+      {/* Analítica complementaria: Costos por Tipo + Resumen por Zona */}
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
+        <div className="xl:col-span-5 rounded-xl border border-gray-200/80 bg-white p-5 shadow-xs space-y-4">
+          <h2 className="text-[15px] font-bold text-gray-900">
+            Desglose de Costos de Transporte
+          </h2>
+
+          <div className="space-y-3">
+            {costosPorTipo.map((c) => (
+              <div key={c.tipo} className="space-y-1">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-semibold text-gray-700">{c.tipo}</span>
+                  <span className="font-bold text-gray-900">
+                    S/. {Number(c.total || 0).toFixed(2)} ({c.percent}%)
+                  </span>
+                </div>
+                <div className="h-2 w-full overflow-hidden rounded-full bg-gray-100">
+                  <div
+                    className={`h-full rounded-full ${
+                      COST_BAR_COLORS[c.tipo] || 'bg-[#147a3f]'
+                    }`}
+                    style={{ width: `${Math.max(4, c.percent)}%` }}
+                  />
+                </div>
+              </div>
+            ))}
+            {costosPorTipo.length === 0 && (
+              <p className="py-6 text-center text-xs text-gray-400">
+                Sin costos registrados en costos_transporte.
+              </p>
+            )}
+          </div>
+        </div>
+
+        <div className="xl:col-span-7 rounded-xl border border-gray-200/80 bg-white p-5 shadow-xs">
+          <h2 className="mb-3 text-[15px] font-bold text-gray-900">
+            Resumen Analítico por Zona
+          </h2>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs sm:text-[13px]">
+              <thead>
+                <tr className="border-b border-gray-200 text-gray-500 font-semibold">
+                  <th className="py-2 pr-3">Zona</th>
+                  <th className="py-2 pr-3">Convocatorias</th>
+                  <th className="py-2 pr-3">Requeridos</th>
+                  <th className="py-2 pr-3">Viajes</th>
+                  <th className="py-2 text-right">Costo Total</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100 text-gray-700">
+                {resumenPorZona.map((z) => (
+                  <tr key={z.id_zona} className="hover:bg-gray-50/70">
+                    <td className="py-2.5 pr-3 font-semibold text-gray-900">{z.zona}</td>
+                    <td className="py-2.5 pr-3">{z.convocatorias}</td>
+                    <td className="py-2.5 pr-3">{z.requeridos}</td>
+                    <td className="py-2.5 pr-3">{z.viajes}</td>
+                    <td className="py-2.5 text-right font-bold text-[#147a3f]">
+                      S/. {Number(z.costo_total || 0).toFixed(2)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      {/* Top Trabajadores Evaluados */}
+      <div className="rounded-xl border border-gray-200/80 bg-white p-5 shadow-xs">
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-[15px] font-bold text-gray-900">
+            Top Trabajadores Evaluados (HPW)
+          </h2>
+          <span className="text-xs text-gray-400">
+            {topTrabajadores.length} destacados
+          </span>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs sm:text-[13px]">
+            <thead>
+              <tr className="border-b border-gray-200 text-gray-500 font-semibold">
+                <th className="py-2 pr-3">DNI</th>
+                <th className="py-2 pr-3">Trabajador</th>
+                <th className="py-2 pr-3">Distrito</th>
+                <th className="py-2 pr-3">Asistencia</th>
+                <th className="py-2 pr-3">Clasificación</th>
+                <th className="py-2 text-right">Puntaje HPW</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100 text-gray-700">
+              {topTrabajadores.map((w) => (
+                <tr key={w.id_trabajador} className="hover:bg-gray-50/70">
+                  <td className="py-2.5 pr-3 font-medium">{w.numero_documento}</td>
+                  <td className="py-2.5 pr-3 font-semibold text-gray-900">
+                    {w.nombres} {w.apellidos}
+                  </td>
+                  <td className="py-2.5 pr-3">{w.distrito}</td>
+                  <td className="py-2.5 pr-3">
+                    {Number(w.porcentaje_asistencia || 0).toFixed(0)}%
+                  </td>
+                  <td className="py-2.5 pr-3">
+                    <span className="inline-flex rounded-full bg-sky-100 px-2.5 py-0.5 text-[11px] font-semibold text-sky-700">
+                      {w.clasificacion_hpw}
+                    </span>
+                  </td>
+                  <td className="py-2.5 text-right font-bold text-[#147a3f]">
+                    {Number(w.puntaje_hpw || 0).toFixed(1)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </div>
     </div>
