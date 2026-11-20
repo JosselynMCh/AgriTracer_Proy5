@@ -4,6 +4,8 @@ import autoTable from 'jspdf-autotable'
 export function exportPrediccionToPdf({
   selectedConv,
   resumen,
+  informeOptimizacion,
+  busesRecomendados = [],
   empresaRecomendada,
   busesDisponibles = [],
   rutaRecomendada,
@@ -59,6 +61,18 @@ export function exportPrediccionToPdf({
   currentY += 6
   doc.setFontSize(9.5)
   doc.setFont('helvetica', 'normal')
+  if (busesRecomendados.length > 0) {
+    doc.text(
+      `Bus óptimo recomendado: ${busesRecomendados
+        .map((b) => `${b.codigo_interno} (${b.capacidad} asientos)`)
+        .join(' + ')} | Ahorro estimado: S/. ${Number(
+        informeOptimizacion?.ahorroEstimado || 0
+      ).toFixed(2)} (${informeOptimizacion?.porcentajeAhorro || 0}%)`,
+      14,
+      currentY
+    )
+    currentY += 5
+  }
   if (empresaRecomendada) {
     doc.text(
       `Empresa recomendada: ${empresaRecomendada.razon_social} | Contacto: ${

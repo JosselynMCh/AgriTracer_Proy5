@@ -11,6 +11,7 @@ export async function getPrediccion(req, res) {
       proveedoresRes,
       rutasRes,
       paraderosRes,
+      costoBaseRes,
     ] = await Promise.all([
       pool.query(`
         SELECT
@@ -31,9 +32,11 @@ export async function getPrediccion(req, res) {
       pool.query(`
         SELECT DISTINCT ON (t.id_trabajador)
           t.id_trabajador,
+          t.tipo_documento,
           t.numero_documento,
           t.nombres,
           t.apellidos,
+          t.telefono,
           t.paradero_preferido,
           COALESCE(d.nombre, 'Sin distrito') AS distrito,
           COALESCE(pr.campana, pr.nombre, 'Campaña anterior') AS campana_anterior,
@@ -103,6 +106,12 @@ export async function getPrediccion(req, res) {
         WHERE latitud IS NOT NULL AND longitud IS NOT NULL
         ORDER BY id_ruta ASC, orden_paradero ASC
       `),
+      pool.query(`
+        SELECT COALESCE(
+          (SELECT ROUND(AVG(costo_por_persona), 2)::float FROM vista_costo_transporte_por_persona WHERE costo_por_persona IS NOT NULL),
+          18.60
+        ) AS costo_por_persona
+      `),
     ])
 
     const convocatorias = convocatoriasRes.rows
@@ -132,7 +141,8 @@ export async function getPrediccion(req, res) {
       (w) => w.requiere_campamento_olmos
     )
 
-    // Predicción de buses disponibles vs requeridos
+    // Predicción de buses disponibles vs requeridos (Best-Fit para minimizar asientos desperdiciados y costos)
+    const costoPorAsiento = Number(costoBaseRes.rows[0]?.costo_por_persona || 18.6)
     const busesDisponibles = busesRes.rows.filter(
       (b) => b.estado_bus === 'DISPONIBLE'
     )
@@ -141,20 +151,166 @@ export async function getPrediccion(req, res) {
       0
     )
 
-    let acumulados = 0
-    const busesRecomendados = []
-    for (const b of busesDisponibles) {
-      if (acumulados >= requeridos && busesRecomendados.length > 0) break
-      busesRecomendados.push(b)
-      acumulados += Number(b.capacidad || 0)
+    // Ordenar de menor a mayor capacidad para Best-Fit
+    const busesAsc = [...busesDisponibles].sort(
+      (a, b) => Number(a.capacidad) - Number(b.capacidad)
+    )
+    const busesDesc = [...busesDisponibles].sort(
+      (a, b) => Number(b.capacidad) - Number(a.capacidad)
+    )
+
+    let busesRecomendados = []
+    let tipoSeleccion = 'SIN_FLOTA'
+    const margenMaximoExceso = Math.max(8, Math.ceil(requeridos * 0.25))
+    const capacidadSimilarObjetivo = Math.max(15, Math.ceil(requeridos / 5) * 5)
+
+    if (requeridos > 0 && busesAsc.length > 0) {
+      // 1. ¿Un solo bus cubre los requeridos con capacidad similar (sin exceso grande)?
+      const singleFit = busesAsc.find((b) => Number(b.capacidad) >= requeridos)
+      if (singleFit && Number(singleFit.capacidad) - requeridos <= margenMaximoExceso) {
+        busesRecomendados = [singleFit]
+        tipoSeleccion = 'UN_BUS_OPTIMO'
+      } else if (singleFit) {
+        // Todos los buses disponibles son muy grandes para lo requerido (ej. 50+ para 35)
+        busesRecomendados = []
+        tipoSeleccion = 'FLOTA_SOBREDIMENSIONADA'
+      } else if (asientosDisponibles >= requeridos) {
+        // 2. Combinación óptima (greedy + ajuste de último bus para minimizar exceso)
+        let sum = 0
+        const picked = []
+        const remaining = [...busesDesc]
+        while (sum < requeridos && remaining.length > 0) {
+          const faltante = requeridos - sum
+          // Si alguno de los restantes cubre exacto/cerca el faltante, tomar el menor que lo cubra
+          const fitLast = [...remaining]
+            .reverse()
+            .find((b) => Number(b.capacidad) >= faltante)
+          const chosen = fitLast || remaining[0]
+          picked.push(chosen)
+          sum += Number(chosen.capacidad)
+          const idx = remaining.findIndex((b) => b.bus_id === chosen.bus_id)
+          remaining.splice(idx, 1)
+        }
+        busesRecomendados = picked
+        tipoSeleccion = 'MULTI_BUS_OPTIMO'
+      } else {
+        busesRecomendados = busesDesc
+        tipoSeleccion = 'FLOTA_INSUFICIENTE'
+      }
     }
 
+    const asientosOptimos =
+      busesRecomendados.length > 0
+        ? busesRecomendados.reduce((sum, b) => sum + Number(b.capacidad || 0), 0)
+        : capacidadSimilarObjetivo
+    const asientosDesperdiciados = Math.max(0, asientosOptimos - requeridos)
+    const ocupacionOptimaPct =
+      asientosOptimos > 0
+        ? Math.min(100, Math.round((requeridos / asientosOptimos) * 100))
+        : 0
+    const costoOptimo = Number((asientosOptimos * costoPorAsiento).toFixed(2))
+
+    // Alternativa sobredimensionada (si se eligiera el bus más grande en vez del óptimo)
+    const busMasGrande = busesDesc[0] || null
+    const asientosSobredimensionados =
+      busMasGrande && Number(busMasGrande.capacidad) > asientosOptimos
+        ? Number(busMasGrande.capacidad)
+        : asientosOptimos + 15
+    const costoSobredimensionado = Number(
+      (asientosSobredimensionados * costoPorAsiento).toFixed(2)
+    )
+    const ahorroEstimado = Number(
+      Math.max(0, costoSobredimensionado - costoOptimo).toFixed(2)
+    )
+    const porcentajeAhorro =
+      costoSobredimensionado > 0
+        ? Math.round((ahorroEstimado / costoSobredimensionado) * 100)
+        : 0
+
     const deficitAsientos = Math.max(0, requeridos - asientosDisponibles)
+    const busExternoSugeridoCapacidad =
+      deficitAsientos > 0
+        ? Math.max(15, Math.ceil(deficitAsientos / 5) * 5)
+        : capacidadSimilarObjetivo
     const busesExtraNecesarios =
-      deficitAsientos > 0 ? Math.ceil(deficitAsientos / 45) : 0
+      deficitAsientos > 0 ? Math.ceil(deficitAsientos / 40) : 0
 
     // Empresa recomendada para contratar más buses
     const empresaRecomendada = proveedoresRes.rows[0] || null
+
+    const escenarios = [
+      {
+        id: 'optimo',
+        titulo: 'Decisión Óptima (Recomendada)',
+        detalle:
+          busesRecomendados.length > 0
+            ? busesRecomendados
+                .map((b) => `${b.codigo_interno} (${b.capacidad} asientos)`)
+                .join(' + ')
+            : `Contratar bus de ${busExternoSugeridoCapacidad} asientos`,
+        asientos: asientosOptimos || busExternoSugeridoCapacidad,
+        desperdicio: asientosDesperdiciados,
+        ocupacionPct: ocupacionOptimaPct,
+        costoEstimado: costoOptimo,
+        impacto:
+          ahorroEstimado > 0
+            ? `Ahorro de S/. ${ahorroEstimado.toFixed(2)} (${porcentajeAhorro}%)`
+            : 'Menor costo operativo',
+        recomendado: true,
+      },
+      {
+        id: 'sobredimensionado',
+        titulo: 'Si se elige un bus más grande (Sobredimensionado)',
+        detalle:
+          busMasGrande && Number(busMasGrande.capacidad) > asientosOptimos
+            ? `${busMasGrande.codigo_interno} (${busMasGrande.capacidad} asientos)`
+            : `Bus estándar de ${asientosSobredimensionados} asientos`,
+        asientos: asientosSobredimensionados,
+        desperdicio: Math.max(0, asientosSobredimensionados - requeridos),
+        ocupacionPct:
+          asientosSobredimensionados > 0
+            ? Math.min(
+                100,
+                Math.round((requeridos / asientosSobredimensionados) * 100)
+              )
+            : 0,
+        costoEstimado: costoSobredimensionado,
+        impacto: `+S/. ${ahorroEstimado.toFixed(2)} de sobrecosto por asientos vacíos`,
+        recomendado: false,
+      },
+      {
+        id: 'externo',
+        titulo: 'Si se contrata flota externa adicional',
+        detalle: empresaRecomendada
+          ? `${empresaRecomendada.razon_social} (${
+              deficitAsientos > 0
+                ? `Bus de ${busExternoSugeridoCapacidad} asientos`
+                : 'Respaldo operativo'
+            })`
+          : 'Proveedor externo',
+        asientos: deficitAsientos > 0 ? busExternoSugeridoCapacidad : requeridos,
+        desperdicio:
+          deficitAsientos > 0
+            ? Math.max(0, busExternoSugeridoCapacidad - deficitAsientos)
+            : 0,
+        ocupacionPct:
+          deficitAsientos > 0 && busExternoSugeridoCapacidad > 0
+            ? Math.round((deficitAsientos / busExternoSugeridoCapacidad) * 100)
+            : 100,
+        costoEstimado: Number(
+          (
+            (deficitAsientos > 0 ? busExternoSugeridoCapacidad : requeridos) *
+            costoPorAsiento *
+            1.15
+          ).toFixed(2)
+        ),
+        impacto:
+          deficitAsientos > 0
+            ? `Cubre el déficit de ${deficitAsientos} asientos (+15% tarifa externa)`
+            : 'Innecesario: la flota propia disponible cubre la demanda (+15% costo extra)',
+        recomendado: deficitAsientos > 0,
+      },
+    ]
 
     // Ruta recomendada hacia campamentos de Olmos (prioriza rutas que conectan distritos lejanos con Olmos o mayor cobertura)
     const rutas = rutasRes.rows
@@ -173,6 +329,22 @@ export async function getPrediccion(req, res) {
         )
       : []
 
+    const recommendedIds = new Set(busesRecomendados.map((b) => b.bus_id))
+    const busesDisponiblesOrdenados = [...busesDisponibles].sort((a, b) => {
+      const aRec = recommendedIds.has(a.bus_id) ? 0 : 1
+      const bRec = recommendedIds.has(b.bus_id) ? 0 : 1
+      if (aRec !== bRec) return aRec - bRec
+
+      const aFit = Number(a.capacidad) >= requeridos ? 0 : 1
+      const bFit = Number(b.capacidad) >= requeridos ? 0 : 1
+      if (aFit !== bFit) return aFit - bFit
+
+      return (
+        Math.abs(Number(a.capacidad) - requeridos) -
+        Math.abs(Number(b.capacidad) - requeridos)
+      )
+    })
+
     return res.json({
       ok: true,
       data: {
@@ -186,8 +358,22 @@ export async function getPrediccion(req, res) {
           trabajadoresParaCampamentoOlmos: trabajadoresLejanos.length,
         },
         mejoresTrabajadores,
-        busesDisponibles,
+        busesDisponibles: busesDisponiblesOrdenados,
         busesRecomendados,
+        informeOptimizacion: {
+          tipoSeleccion,
+          capacidadSimilarObjetivo,
+          costoPorAsiento,
+          costoOptimo,
+          costoSobredimensionado,
+          ahorroEstimado,
+          porcentajeAhorro,
+          asientosOptimos,
+          asientosDesperdiciados,
+          ocupacionOptimaPct,
+          busExternoSugeridoCapacidad,
+          escenarios,
+        },
         proveedores: proveedoresRes.rows,
         empresaRecomendada,
         rutaRecomendada: rutaOlmos

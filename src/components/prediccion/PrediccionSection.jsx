@@ -3,12 +3,28 @@ import { apiFetch } from '../../services/apiClient'
 import { exportPrediccionToPdf } from '../../utils/exportPrediccionPdf'
 import GoogleMapView from '../common/GoogleMapView'
 import LoadingOverlay from '../common/LoadingOverlay'
+import WorkerPerformanceModal from '../trabajadores/WorkerPerformanceModal'
+
+function buildWhatsAppUrl(phone, worker, campanaTitulo) {
+  const digits = String(phone || '').replace(/\D/g, '')
+  if (!digits) return null
+  const normalized = digits.length === 9 ? `51${digits}` : digits
+  const text = encodeURIComponent(
+    `Hola ${worker.nombres}, te contactamos de Agrovisión (Agri-Tracer) por la campaña "${
+      campanaTitulo || 'próxima campaña'
+    }".`
+  )
+  return `https://wa.me/${normalized}?text=${text}`
+}
 
 export default function PrediccionSection() {
   const [selectedConvId, setSelectedConvId] = useState('')
   const [loadedKey, setLoadedKey] = useState(null)
   const [data, setData] = useState(null)
   const [error, setError] = useState('')
+  const [detailWorker, setDetailWorker] = useState(null)
+  const [detailData, setDetailData] = useState(null)
+  const [loadingDetail, setLoadingDetail] = useState(false)
 
   const queryKey = selectedConvId || 'default'
 
@@ -41,8 +57,12 @@ export default function PrediccionSection() {
   const resumen = data?.resumen || {}
   const mejoresTrabajadores = data?.mejoresTrabajadores || []
   const busesDisponibles = data?.busesDisponibles || []
+  const busesRecomendados = data?.busesRecomendados || []
+  const informeOptimizacion = data?.informeOptimizacion || {}
   const empresaRecomendada = data?.empresaRecomendada
   const rutaRecomendada = data?.rutaRecomendada
+
+  const recommendedBusIds = new Set(busesRecomendados.map((b) => b.bus_id))
 
   const { polylines, markers } = useMemo(() => {
     const paraderos = rutaRecomendada?.paraderos || []
@@ -80,6 +100,8 @@ export default function PrediccionSection() {
     exportPrediccionToPdf({
       selectedConv,
       resumen,
+      informeOptimizacion,
+      busesRecomendados,
       empresaRecomendada,
       busesDisponibles,
       rutaRecomendada,
@@ -87,9 +109,23 @@ export default function PrediccionSection() {
     })
   }
 
+  const openWorkerDetail = async (worker) => {
+    setDetailWorker(worker)
+    setLoadingDetail(true)
+    setDetailData(null)
+    try {
+      const res = await apiFetch(`/api/trabajadores/${worker.id_trabajador}/detalle`)
+      setDetailData(res)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setLoadingDetail(false)
+    }
+  }
+
   return (
     <div className="space-y-4">
-      <LoadingOverlay show={loading} />
+      <LoadingOverlay show={loading || loadingDetail} />
 
       {/* Encabezado + Selector de campaña */}
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -202,14 +238,53 @@ export default function PrediccionSection() {
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
         {/* Flota y Empresa recomendada */}
         <div className="xl:col-span-6 rounded-xl border border-gray-200/80 bg-white p-5 shadow-xs space-y-4">
-          <h2 className="text-[15px] font-bold text-gray-900">
-            Predicción de Buses y Contratación
-          </h2>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-[15px] font-bold text-gray-900">
+              Predicción de Buses y Contratación
+            </h2>
+            {informeOptimizacion.ahorroEstimado > 0 && (
+              <span className="rounded-full bg-emerald-100 px-2.5 py-0.5 text-[11px] font-bold text-emerald-800">
+                Ahorro óptimo: S/. {informeOptimizacion.ahorroEstimado.toFixed(2)} ({informeOptimizacion.porcentajeAhorro}%)
+              </span>
+            )}
+          </div>
+
+          {/* Bus óptimo recomendado (Best-Fit) */}
+          {busesRecomendados.length > 0 ? (
+            <div className="rounded-xl border border-sky-200 bg-sky-50/70 p-3.5 space-y-1">
+              <p className="text-[11px] font-bold uppercase tracking-wide text-sky-800">
+                Bus óptimo recomendado (capacidad similar sin desperdicio)
+              </p>
+              <p className="text-sm font-bold text-gray-900">
+                {busesRecomendados
+                  .map((b) => `${b.codigo_interno} (${b.capacidad} asientos)`)
+                  .join(' + ')}
+              </p>
+              <p className="text-xs text-gray-600">
+                Cubre <strong>{resumen.trabajadoresRequeridos}</strong> requeridos con{' '}
+                <strong>{informeOptimizacion.ocupacionOptimaPct ?? 0}%</strong> de ocupación (
+                {informeOptimizacion.asientosDesperdiciados ?? 0} asientos libres) &bull; Costo estimado:{' '}
+                <strong>S/. {(informeOptimizacion.costoOptimo ?? 0).toFixed(2)}</strong>
+              </p>
+            </div>
+          ) : (
+            <div className="rounded-xl border border-amber-200 bg-amber-50/70 p-3.5 space-y-1">
+              <p className="text-[11px] font-bold uppercase tracking-wide text-amber-800">
+                Unidad de capacidad similar recomendada
+              </p>
+              <p className="text-sm font-bold text-gray-900">
+                Contratar bus de {informeOptimizacion.capacidadSimilarObjetivo || resumen.trabajadoresRequeridos} asientos
+              </p>
+              <p className="text-xs text-gray-600">
+                Para <strong>{resumen.trabajadoresRequeridos}</strong> requeridos, los buses propios disponibles tienen demasiados asientos vacíos; conviene una unidad de capacidad similar ({informeOptimizacion.ocupacionOptimaPct ?? 100}% ocupación).
+              </p>
+            </div>
+          )}
 
           {/* Empresa recomendada */}
           {empresaRecomendada && (
             <div className="rounded-xl border border-emerald-200 bg-emerald-50/60 p-4 space-y-1.5">
-              <div className="flex items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="text-[11px] font-bold uppercase tracking-wide text-[#0b3d2c]">
                   Empresa recomendada para contratar más buses
                 </span>
@@ -222,8 +297,14 @@ export default function PrediccionSection() {
               </p>
               <p className="text-xs text-gray-600">
                 Contacto: <strong>{empresaRecomendada.nombre_contacto || '—'}</strong> &bull; Tel:{' '}
-                <strong>{empresaRecomendada.telefono || '—'}</strong> &bull; Capacidad total:{' '}
-                <strong>{empresaRecomendada.capacidad_total} asientos</strong>
+                <strong>{empresaRecomendada.telefono || '—'}</strong>
+                {resumen.deficitAsientos > 0 && (
+                  <>
+                    {' '}
+                    &bull; Contratar unidad óptima de{' '}
+                    <strong>{informeOptimizacion.busExternoSugeridoCapacidad} asientos</strong>
+                  </>
+                )}
               </p>
             </div>
           )}
@@ -244,18 +325,29 @@ export default function PrediccionSection() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100 text-gray-700">
-                  {busesDisponibles.map((b) => (
-                    <tr key={b.bus_id}>
-                      <td className="py-2.5 pr-3 font-semibold text-gray-900">
-                        {b.codigo_interno}
-                      </td>
-                      <td className="py-2.5 pr-3">{b.numero_placa}</td>
-                      <td className="py-2.5 pr-3">{b.proveedor}</td>
-                      <td className="py-2.5 font-bold text-[#147a3f]">
-                        {b.capacidad}
-                      </td>
-                    </tr>
-                  ))}
+                  {busesDisponibles.map((b) => {
+                    const isOptimal = recommendedBusIds.has(b.bus_id)
+                    return (
+                      <tr
+                        key={b.bus_id}
+                        className={isOptimal ? 'bg-emerald-50/70' : ''}
+                      >
+                        <td className="py-2.5 pr-3 font-semibold text-gray-900 whitespace-nowrap">
+                          {b.codigo_interno}
+                          {isOptimal && (
+                            <span className="ml-1.5 rounded-full bg-[#147a3f] px-2 py-0.5 text-[10px] font-bold text-white">
+                              Óptimo
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2.5 pr-3">{b.numero_placa}</td>
+                        <td className="py-2.5 pr-3">{b.proveedor}</td>
+                        <td className="py-2.5 font-bold text-[#147a3f]">
+                          {b.capacidad}
+                        </td>
+                      </tr>
+                    )
+                  })}
                   {busesDisponibles.length === 0 && (
                     <tr>
                       <td colSpan={4} className="py-4 text-center text-gray-400">
@@ -315,6 +407,66 @@ export default function PrediccionSection() {
         </div>
       </div>
 
+      {/* Informe de Optimización de Costos y Escenarios */}
+      {informeOptimizacion.escenarios?.length > 0 && (
+        <div className="rounded-xl border border-gray-200/80 bg-white p-5 shadow-xs space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="text-[15px] font-bold text-gray-900">
+                Informe de Optimización de Costos y Simulación de Decisiones
+              </h2>
+              <p className="text-xs text-gray-500">
+                Comparativa basada en el costo promedio por asiento (S/.{' '}
+                {Number(informeOptimizacion.costoPorAsiento || 0).toFixed(2)}) y qué pasaría si se elige otra alternativa
+              </p>
+            </div>
+            {informeOptimizacion.ahorroEstimado > 0 && (
+              <div className="rounded-lg bg-emerald-50 border border-emerald-200 px-3 py-1.5 text-xs font-bold text-[#0b3d2c]">
+                Reducción estimada: S/. {informeOptimizacion.ahorroEstimado.toFixed(2)} ({informeOptimizacion.porcentajeAhorro}%)
+              </div>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+            {informeOptimizacion.escenarios.map((esc) => (
+              <div
+                key={esc.id}
+                className={`rounded-xl border p-4 space-y-2 ${
+                  esc.recomendado
+                    ? 'border-emerald-300 bg-emerald-50/50'
+                    : 'border-gray-200 bg-gray-50/60'
+                }`}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <h3 className="text-xs font-bold text-gray-900">{esc.titulo}</h3>
+                  {esc.recomendado && (
+                    <span className="shrink-0 rounded-full bg-[#147a3f] px-2 py-0.5 text-[10px] font-bold text-white">
+                      Recomendado
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs font-semibold text-gray-700">{esc.detalle}</p>
+                <div className="flex items-baseline justify-between border-t border-gray-200/70 pt-2 text-xs">
+                  <span className="text-gray-500">
+                    Ocupación: <strong>{esc.ocupacionPct}%</strong> ({esc.desperdicio} vacíos)
+                  </span>
+                  <span className="text-sm font-bold text-gray-900">
+                    S/. {Number(esc.costoEstimado || 0).toFixed(2)}
+                  </span>
+                </div>
+                <p
+                  className={`text-[11px] font-semibold ${
+                    esc.recomendado ? 'text-emerald-700' : 'text-amber-700'
+                  }`}
+                >
+                  {esc.impacto}
+                </p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Historial de mejores trabajadores en campañas anteriores */}
       <div className="rounded-xl border border-gray-200/80 bg-white p-5 shadow-xs">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -341,49 +493,108 @@ export default function PrediccionSection() {
                 <th className="py-2.5 pr-3">Campaña Anterior</th>
                 <th className="py-2.5 pr-3">Puntaje HPW</th>
                 <th className="py-2.5 pr-3">Asistencia</th>
-                <th className="py-2.5">Alojamiento / Traslado</th>
+                <th className="py-2.5 pr-3">Alojamiento / Traslado</th>
+                <th className="py-2.5 text-right">Acciones</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100 text-gray-700">
-              {mejoresTrabajadores.map((w, idx) => (
-                <tr key={w.id_trabajador} className="hover:bg-gray-50/70">
-                  <td className="py-3 pr-3 font-bold text-gray-500">{idx + 1}</td>
-                  <td className="py-3 pr-3">
-                    <p className="font-semibold text-gray-900">
-                      {w.nombres} {w.apellidos}
-                    </p>
-                    <p className="text-[11px] text-gray-400">
-                      DNI: {w.numero_documento}
-                    </p>
-                  </td>
-                  <td className="py-3 pr-3">
-                    <p className="font-medium text-gray-800">{w.distrito}</p>
-                    <p className="text-[11px] text-gray-400">
-                      {w.paradero_preferido || 'Paradero central'}
-                    </p>
-                  </td>
-                  <td className="py-3 pr-3">{w.campana_anterior}</td>
-                  <td className="py-3 pr-3 font-bold text-[#147a3f]">
-                    {w.puntaje_hpw.toFixed(1)}
-                  </td>
-                  <td className="py-3 pr-3">{w.porcentaje_asistencia.toFixed(0)}%</td>
-                  <td className="py-3">
-                    {w.requiere_campamento_olmos ? (
-                      <span className="inline-flex rounded-full bg-amber-100 px-2.5 py-0.5 text-[11px] font-semibold text-amber-800">
-                        Campamento Olmos (Zona lejana)
-                      </span>
-                    ) : (
-                      <span className="inline-flex rounded-full bg-emerald-100 px-2.5 py-0.5 text-[11px] font-semibold text-emerald-700">
-                        Traslado local
-                      </span>
-                    )}
-                  </td>
-                </tr>
-              ))}
+              {mejoresTrabajadores.map((w, idx) => {
+                const wspUrl = buildWhatsAppUrl(
+                  w.telefono,
+                  w,
+                  selectedConv?.titulo
+                )
+                return (
+                  <tr key={w.id_trabajador} className="hover:bg-gray-50/70">
+                    <td className="py-3 pr-3 font-bold text-gray-500">{idx + 1}</td>
+                    <td className="py-3 pr-3">
+                      <p className="font-semibold text-gray-900">
+                        {w.nombres} {w.apellidos}
+                      </p>
+                      <p className="text-[11px] text-gray-400">
+                        DNI: {w.numero_documento}
+                      </p>
+                    </td>
+                    <td className="py-3 pr-3">
+                      <p className="font-medium text-gray-800">{w.distrito}</p>
+                      <p className="text-[11px] text-gray-400">
+                        {w.paradero_preferido || 'Paradero central'}
+                      </p>
+                    </td>
+                    <td className="py-3 pr-3">{w.campana_anterior}</td>
+                    <td className="py-3 pr-3 font-bold text-[#147a3f]">
+                      {w.puntaje_hpw.toFixed(1)}
+                    </td>
+                    <td className="py-3 pr-3">{w.porcentaje_asistencia.toFixed(0)}%</td>
+                    <td className="py-3 pr-3">
+                      {w.requiere_campamento_olmos ? (
+                        <span className="inline-flex rounded-full bg-amber-100 px-2.5 py-0.5 text-[11px] font-semibold text-amber-800">
+                          Campamento Olmos (Zona lejana)
+                        </span>
+                      ) : (
+                        <span className="inline-flex rounded-full bg-emerald-100 px-2.5 py-0.5 text-[11px] font-semibold text-emerald-700">
+                          Traslado local
+                        </span>
+                      )}
+                    </td>
+                    <td className="py-3 text-right">
+                      <div className="inline-flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => openWorkerDetail(w)}
+                          title="Ver detalle de rendimiento"
+                          aria-label={`Ver detalle de ${w.nombres}`}
+                          className="rounded-lg p-1.5 text-[#0284c7] hover:bg-sky-50 cursor-pointer"
+                        >
+                          <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+                            <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z" />
+                            <circle cx="12" cy="12" r="3" />
+                          </svg>
+                        </button>
+
+                        {wspUrl ? (
+                          <a
+                            href={wspUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title={`Contactar por WhatsApp (${w.telefono})`}
+                            aria-label={`WhatsApp de ${w.nombres}`}
+                            className="rounded-lg p-1.5 text-[#147a3f] hover:bg-emerald-50"
+                          >
+                            <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+                              <rect x="5" y="2" width="14" height="20" rx="2" ry="2" />
+                              <line x1="12" x2="12.01" y1="18" y2="18" />
+                            </svg>
+                          </a>
+                        ) : (
+                          <span
+                            title="Sin teléfono registrado"
+                            className="rounded-lg p-1.5 text-gray-300 cursor-not-allowed"
+                          >
+                            <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+                              <rect x="5" y="2" width="14" height="20" rx="2" ry="2" />
+                              <line x1="12" x2="12.01" y1="18" y2="18" />
+                            </svg>
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
         </div>
       </div>
+
+      {detailWorker && (
+        <WorkerPerformanceModal
+          worker={detailWorker}
+          detailData={detailData}
+          loading={loadingDetail}
+          onClose={() => setDetailWorker(null)}
+        />
+      )}
     </div>
   )
 }
